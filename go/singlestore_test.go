@@ -1893,7 +1893,7 @@ func createTempCertAndKey(t *testing.T) (string, string) {
 
 	certOut, err := os.CreateTemp("", "test_cert_*.pem")
 	require.NoError(t, err)
-	defer certOut.Close()
+	defer func() { _ = certOut.Close() }()
 	err = pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 	require.NoError(t, err)
 
@@ -1901,7 +1901,7 @@ func createTempCertAndKey(t *testing.T) (string, string) {
 	require.NoError(t, err)
 	keyOut, err := os.CreateTemp("", "test_key_*.pem")
 	require.NoError(t, err)
-	defer keyOut.Close()
+	defer func() { _ = keyOut.Close() }()
 	err = pem.Encode(keyOut, &pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
 	require.NoError(t, err)
 
@@ -1911,8 +1911,8 @@ func createTempCertAndKey(t *testing.T) (string, string) {
 func TestCustomTLS(t *testing.T) {
 	factory := singlestore.NewSingleStoreDBFactory()
 	certFile, keyFile := createTempCertAndKey(t)
-	defer os.Remove(certFile)
-	defer os.Remove(keyFile)
+	defer func() { _ = os.Remove(certFile) }()
+	defer func() { _ = os.Remove(keyFile) }()
 
 	t.Run("valid_ca_in_uri", func(t *testing.T) {
 		opts := map[string]string{
@@ -1959,9 +1959,9 @@ func TestCustomTLS(t *testing.T) {
 	t.Run("invalid_ca_pem_errors", func(t *testing.T) {
 		badFile, err := os.CreateTemp("", "bad_ca_*.pem")
 		require.NoError(t, err)
-		defer os.Remove(badFile.Name())
+		defer func() { _ = os.Remove(badFile.Name()) }()
 		_, _ = badFile.WriteString("this is not a valid pem certificate")
-		badFile.Close()
+		require.NoError(t, badFile.Close())
 
 		opts := map[string]string{
 			adbc.OptionKeyURI: "mysql://user:pass@localhost:3306/testdb?ssl_ca=" + badFile.Name(),
@@ -1983,7 +1983,19 @@ func TestCustomTLS(t *testing.T) {
 			adbc.OptionKeyURI: fmt.Sprintf("mysql://user:pass@localhost:3306/testdb?ssl_ca=%s&tls=false", url.QueryEscape(certFile)),
 		}
 		_, err := factory.BuildSingleStoreDSN(opts)
-		require.ErrorContains(t, err, "ssl_ca cannot be used with ssl_mode: disabled")
+		require.ErrorContains(t, err, `custom TLS options (ssl_ca, ssl_cert, ssl_key) cannot be used when TLS is disabled (tls="false")`)
+	})
+
+	t.Run("postgres_style_sslmode_aliases", func(t *testing.T) {
+		_, tlsVerifyCA, err := singlestore.BuildCustomTLSConfig("other.example.com", "verify-ca", certFile, "", "")
+		require.NoError(t, err)
+		assert.True(t, tlsVerifyCA.InsecureSkipVerify, "verify-ca should skip standard hostname check and use VerifyPeerCertificate")
+		assert.NotNil(t, tlsVerifyCA.VerifyPeerCertificate, "verify-ca must set VerifyPeerCertificate for CA-only verification")
+
+		_, tlsRequire, err := singlestore.BuildCustomTLSConfig("other.example.com", "require", certFile, "", "")
+		require.NoError(t, err)
+		assert.True(t, tlsRequire.InsecureSkipVerify, "require should encrypt without verifying peer certificate or hostname")
+		assert.Nil(t, tlsRequire.VerifyPeerCertificate, "require must not install VerifyPeerCertificate")
 	})
 
 	t.Run("timeout_normalized_with_unit", func(t *testing.T) {
@@ -2063,25 +2075,25 @@ func TestSingleStoreHardening(t *testing.T) {
 
 		db, err := drv.NewDatabaseWithContext(ctx, q.DatabaseOptions())
 		require.NoError(t, err)
-		defer db.Close(ctx)
+		defer func() { _ = db.Close(ctx) }()
 
 		conn, err := db.Open(ctx)
 		require.NoError(t, err)
-		defer conn.Close(ctx)
+		defer func() { _ = conn.Close(ctx) }()
 
 		stmt, err := conn.NewStatement(ctx)
 		require.NoError(t, err)
-		defer stmt.Close(ctx)
+		defer func() { _ = stmt.Close(ctx) }()
 
 		t.Run("unsigned_integers", func(t *testing.T) {
 			rawDB, err := sql.Open("mysql", q.dsn)
 			require.NoError(t, err)
-			defer rawDB.Close()
+			defer func() { _ = rawDB.Close() }()
 
 			_, _ = rawDB.Exec("DROP TABLE IF EXISTS test_uints")
 			_, err = rawDB.Exec("CREATE TABLE test_uints (u8 TINYINT UNSIGNED, u16 SMALLINT UNSIGNED, u32 INT UNSIGNED, u64 BIGINT UNSIGNED)")
 			require.NoError(t, err)
-			defer rawDB.Exec("DROP TABLE IF EXISTS test_uints")
+			defer func() { _, _ = rawDB.Exec("DROP TABLE IF EXISTS test_uints") }()
 
 			_, err = rawDB.Exec("INSERT INTO test_uints VALUES (255, 65535, 4294967295, 18446744073709551615)")
 			require.NoError(t, err)
@@ -2092,7 +2104,7 @@ func TestSingleStoreHardening(t *testing.T) {
 			defer r.Release()
 
 			require.True(t, r.Next())
-			rec := r.Record()
+			rec := r.RecordBatch()
 			schema := rec.Schema()
 			assert.Equal(t, arrow.PrimitiveTypes.Uint8.ID(), schema.Field(0).Type.ID())
 			assert.Equal(t, arrow.PrimitiveTypes.Uint16.ID(), schema.Field(1).Type.ID())
@@ -2112,7 +2124,7 @@ func TestSingleStoreHardening(t *testing.T) {
 			defer r.Release()
 
 			require.True(t, r.Next())
-			rec := r.Record()
+			rec := r.RecordBatch()
 			assert.Equal(t, arrow.FixedWidthTypes.Time32s.ID(), rec.Schema().Field(0).Type.ID())
 			col0 := rec.Column(0).(*array.Time32)
 			col1 := rec.Column(1).(*array.Time32)
@@ -2123,7 +2135,7 @@ func TestSingleStoreHardening(t *testing.T) {
 		t.Run("statement_cancel_stops_server_query", func(t *testing.T) {
 			s2, err := conn.NewStatement(ctx)
 			require.NoError(t, err)
-			defer s2.Close(ctx)
+			defer func() { _ = s2.Close(ctx) }()
 
 			start := time.Now()
 			require.NoError(t, s2.SetSqlQuery(ctx, "SELECT SLEEP(5)"))
@@ -2151,7 +2163,7 @@ func TestSingleStoreHardening(t *testing.T) {
 
 			s, err := conn.NewStatement(ctx)
 			require.NoError(t, err)
-			defer s.Close(ctx)
+			defer func() { _ = s.Close(ctx) }()
 			sCanceller, ok := s.(interface{ Cancel(context.Context) error })
 			require.True(t, ok)
 			require.NoError(t, sCanceller.Cancel(ctx))
@@ -2160,17 +2172,17 @@ func TestSingleStoreHardening(t *testing.T) {
 		t.Run("cancel_after_session_gone", func(t *testing.T) {
 			conn2, err := db.Open(ctx)
 			require.NoError(t, err)
-			defer conn2.Close(ctx)
+			defer func() { _ = conn2.Close(ctx) }()
 
 			s2, err := conn2.NewStatement(ctx)
 			require.NoError(t, err)
-			defer s2.Close(ctx)
+			defer func() { _ = s2.Close(ctx) }()
 			require.NoError(t, s2.SetSqlQuery(ctx, "SELECT CONNECTION_ID()"))
 			r, _, err := s2.ExecuteQuery(ctx)
 			require.NoError(t, err)
 			defer r.Release()
 			require.True(t, r.Next())
-			rec := r.Record()
+			rec := r.RecordBatch()
 			var victimID uint64
 			if col := rec.Column(0); col != nil {
 				switch c := col.(type) {
@@ -2188,7 +2200,7 @@ func TestSingleStoreHardening(t *testing.T) {
 
 			rawDB, err := sql.Open("mysql", q.dsn)
 			require.NoError(t, err)
-			defer rawDB.Close()
+			defer func() { _ = rawDB.Close() }()
 
 			_, err = rawDB.Exec(fmt.Sprintf("KILL %d", victimID))
 			require.NoError(t, err)
@@ -2222,7 +2234,7 @@ func TestSingleStoreHardening(t *testing.T) {
 			require.NoError(t, err)
 			s1, err := conn1.NewStatement(ctx)
 			require.NoError(t, err)
-			defer s1.Close(ctx)
+			defer func() { _ = s1.Close(ctx) }()
 
 			require.NoError(t, conn1.Close(ctx))
 
@@ -2236,11 +2248,11 @@ func TestSingleStoreHardening(t *testing.T) {
 			// Start a second session running a sleep query
 			conn2, err := db.Open(ctx)
 			require.NoError(t, err)
-			defer conn2.Close(ctx)
+			defer func() { _ = conn2.Close(ctx) }()
 
 			s2, err := conn2.NewStatement(ctx)
 			require.NoError(t, err)
-			defer s2.Close(ctx)
+			defer func() { _ = s2.Close(ctx) }()
 			require.NoError(t, s2.SetSqlQuery(ctx, "SELECT SLEEP(2)"))
 
 			sleepStarted := make(chan struct{})

@@ -17,6 +17,7 @@ package singlestore
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"encoding/base64"
 	"errors"
@@ -802,8 +803,9 @@ func formatSingleStoreTimeInMicros(t int64) string {
 type singlestoreConnectionImpl struct {
 	*sqlwrapper.ConnectionImplBase // Embed sqlwrapper connection for all standard functionality
 
-	version string
-	connID  atomic.Uint64
+	version      string
+	connID       atomic.Uint64
+	aggregatorID atomic.Int64
 }
 
 func (c *singlestoreConnectionImpl) Cancel(ctx context.Context) error {
@@ -811,8 +813,16 @@ func (c *singlestoreConnectionImpl) Cancel(ctx context.Context) error {
 	if c.Db == nil || connID == 0 {
 		return c.ErrorHelper.InvalidState("cannot cancel: connection is closed or connection ID is not available")
 	}
-	// Note: a race remains where KILL may be issued while Close is concurrently running; this is acceptable.
-	_, err := c.Db.ExecContext(ctx, fmt.Sprintf("KILL QUERY %d", connID))
+	// Note: sqlwrapper.ExecuteQuery uses context.Background() so that context cancellation
+	// does not close the pinned *sql.Conn. We therefore issue KILL QUERY <conn_id> <node_id>
+	// directly over a separate pool connection (matching go-singlestore-driver's killQuery).
+	var killQuery string
+	if aggID := c.aggregatorID.Load(); aggID > 0 {
+		killQuery = fmt.Sprintf("KILL QUERY %d %d", connID, aggID)
+	} else {
+		killQuery = fmt.Sprintf("KILL QUERY %d", connID)
+	}
+	_, err := c.Db.ExecContext(ctx, killQuery)
 	if err != nil {
 		var myErr *mysql.MySQLError
 		if errors.As(err, &myErr) && myErr.Number == 1094 {
@@ -931,6 +941,7 @@ func unregisterConnection(base *driverbase.ConnectionImplBase) {
 func (c *singlestoreConnectionImpl) Close(ctx context.Context) error {
 	defer unregisterConnection(c.Base())
 	c.connID.Swap(0)
+	c.aggregatorID.Store(0)
 	return c.ConnectionImplBase.Close(ctx)
 }
 
@@ -978,14 +989,18 @@ func (f *singlestoreConnectionFactory) CreateConnection(
 	conn *sqlwrapper.ConnectionImplBase,
 ) (sqlwrapper.ConnectionImpl, error) {
 	var connID uint64
-	if err := conn.Conn.QueryRowContext(ctx, "SELECT CONNECTION_ID()").Scan(&connID); err != nil {
-		return nil, conn.ErrorHelper.WrapIO(err, "failed to get connection ID")
+	var aggregatorID sql.NullInt64
+	if err := conn.Conn.QueryRowContext(ctx, "SELECT CONNECTION_ID() :> BIGINT, AGGREGATOR_ID() :> BIGINT").Scan(&connID, &aggregatorID); err != nil {
+		return nil, conn.ErrorHelper.WrapIO(err, "failed to get connection and aggregator IDs")
 	}
 
 	impl := &singlestoreConnectionImpl{
 		ConnectionImplBase: conn,
 	}
 	impl.connID.Store(connID)
+	if aggregatorID.Valid {
+		impl.aggregatorID.Store(aggregatorID.Int64)
+	}
 	registerConnection(conn.Base(), impl)
 	return impl, nil
 }

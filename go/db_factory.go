@@ -92,15 +92,21 @@ func (f *SingleStoreDBFactory) forceUTCTimezone(dsn string, logger *slog.Logger)
 	return cfg.FormatDSN(), nil
 }
 
-// hasCustomTLSOptions returns true if any custom TLS certificate options are provided.
-func hasCustomTLSOptions(opts map[string]string, q url.Values) bool {
-	if opts != nil {
-		if opts["ssl_ca"] != "" || opts["sslrootcert"] != "" || opts["ssl_cert"] != "" || opts["ssl_key"] != "" {
-			return true
+var customTLSOptions = [...]string{"ssl_ca", "sslrootcert", "ssl_cert", "ssl_key"}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
 		}
 	}
-	if q != nil {
-		if q.Get("ssl_ca") != "" || q.Get("sslrootcert") != "" || q.Get("ssl_cert") != "" || q.Get("ssl_key") != "" {
+	return ""
+}
+
+// hasCustomTLSOptions returns true if any custom TLS certificate options are provided.
+func hasCustomTLSOptions(opts map[string]string, q url.Values) bool {
+	for _, opt := range customTLSOptions {
+		if opts[opt] != "" || q.Get(opt) != "" {
 			return true
 		}
 	}
@@ -109,7 +115,7 @@ func hasCustomTLSOptions(opts map[string]string, q url.Values) bool {
 
 // hasTimeoutOptions returns true if timeout or connect_timeout is provided in opts.
 func hasTimeoutOptions(opts map[string]string) bool {
-	return opts != nil && (opts["timeout"] != "" || opts["connect_timeout"] != "")
+	return opts["timeout"] != "" || opts["connect_timeout"] != ""
 }
 
 // normalizeTLSHostname extracts the bare hostname (without port or IPv6 brackets)
@@ -129,7 +135,7 @@ func buildCustomTLSConfig(hostname, requestedTLS, sslCA, sslCert, sslKey string)
 	hostname = normalizeTLSHostname(hostname)
 	if strings.EqualFold(requestedTLS, "false") || strings.EqualFold(requestedTLS, "disable") ||
 		strings.EqualFold(requestedTLS, "disabled") || strings.EqualFold(requestedTLS, "off") {
-		return "", nil, fmt.Errorf("ssl_ca cannot be used with ssl_mode: disabled")
+		return "", nil, fmt.Errorf("custom TLS options (ssl_ca, ssl_cert, ssl_key) cannot be used when TLS is disabled (tls=%q)", requestedTLS)
 	}
 
 	var rootCertPool *x509.CertPool
@@ -162,9 +168,9 @@ func buildCustomTLSConfig(hostname, requestedTLS, sslCA, sslCert, sslKey string)
 	}
 
 	switch strings.ToLower(requestedTLS) {
-	case "skip-verify", "required":
+	case "skip-verify", "required", "require", "preferred", "prefer":
 		tlsConfig.InsecureSkipVerify = true
-	case "verify_ca":
+	case "verify_ca", "verify-ca":
 		tlsConfig.InsecureSkipVerify = true
 		pool := rootCertPool
 		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
@@ -329,36 +335,10 @@ func (f *SingleStoreDBFactory) parseToSingleStoreDSN(singlestoreURI, username, p
 
 	q := u.Query()
 	if hasCustomTLSOptions(opts, q) {
-		sslCA := q.Get("ssl_ca")
-		if sslCA == "" {
-			sslCA = q.Get("sslrootcert")
-		}
-		if opts != nil {
-			if v := opts["ssl_ca"]; v != "" {
-				sslCA = v
-			} else if v := opts["sslrootcert"]; v != "" {
-				sslCA = v
-			}
-		}
-
-		sslCert := q.Get("ssl_cert")
-		if opts != nil && opts["ssl_cert"] != "" {
-			sslCert = opts["ssl_cert"]
-		}
-
-		sslKey := q.Get("ssl_key")
-		if opts != nil && opts["ssl_key"] != "" {
-			sslKey = opts["ssl_key"]
-		}
-
-		requestedTLS := q.Get("tls")
-		if requestedTLS == "" && opts != nil {
-			if v := opts["ssl_mode"]; v != "" {
-				requestedTLS = v
-			} else if v := opts["sslmode"]; v != "" {
-				requestedTLS = v
-			}
-		}
+		sslCA := firstNonEmpty(opts["ssl_ca"], opts["sslrootcert"], q.Get("ssl_ca"), q.Get("sslrootcert"))
+		sslCert := firstNonEmpty(opts["ssl_cert"], q.Get("ssl_cert"))
+		sslKey := firstNonEmpty(opts["ssl_key"], q.Get("ssl_key"))
+		requestedTLS := firstNonEmpty(q.Get("tls"), opts["ssl_mode"], opts["sslmode"], q.Get("ssl_mode"), q.Get("sslmode"))
 
 		configKey, err := setupCustomTLS(u.Hostname(), requestedTLS, sslCA, sslCert, sslKey)
 		if err != nil {
@@ -366,26 +346,21 @@ func (f *SingleStoreDBFactory) parseToSingleStoreDSN(singlestoreURI, username, p
 		}
 
 		q.Set("tls", configKey)
-		q.Del("ssl_ca")
-		q.Del("sslrootcert")
-		q.Del("ssl_cert")
-		q.Del("ssl_key")
+		for _, opt := range customTLSOptions {
+			q.Del(opt)
+		}
+		q.Del("ssl_mode")
+		q.Del("sslmode")
 		u.RawQuery = q.Encode()
 	}
 
 	// Normalize connect_timeout / timeout if passed in opts or query without unit
-	if opts != nil {
-		to := opts["timeout"]
-		if to == "" {
-			to = opts["connect_timeout"]
+	if to := firstNonEmpty(opts["timeout"], opts["connect_timeout"]); to != "" && q.Get("timeout") == "" {
+		if _, err := strconv.Atoi(to); err == nil {
+			to += "s"
 		}
-		if to != "" && q.Get("timeout") == "" {
-			if _, err := strconv.Atoi(to); err == nil {
-				to += "s"
-			}
-			q.Set("timeout", to)
-			u.RawQuery = q.Encode()
-		}
+		q.Set("timeout", to)
+		u.RawQuery = q.Encode()
 	}
 	if t := q.Get("timeout"); t != "" {
 		if _, err := strconv.Atoi(t); err == nil {
@@ -439,45 +414,28 @@ func (f *SingleStoreDBFactory) buildFromNativeDSN(baseURI, username, password, a
 		cfg.Params["autocommit"] = autocommit
 	}
 
-	if opts != nil {
-		if to := opts["timeout"]; to != "" {
-			if d, err := time.ParseDuration(to); err == nil {
-				cfg.Timeout = d
-			} else if s, err := strconv.Atoi(to); err == nil {
-				cfg.Timeout = time.Duration(s) * time.Second
-			}
-		} else if to := opts["connect_timeout"]; to != "" {
-			if d, err := time.ParseDuration(to); err == nil {
-				cfg.Timeout = d
-			} else if s, err := strconv.Atoi(to); err == nil {
-				cfg.Timeout = time.Duration(s) * time.Second
-			}
+	if to := firstNonEmpty(opts["timeout"], opts["connect_timeout"]); to != "" {
+		if d, err := time.ParseDuration(to); err == nil {
+			cfg.Timeout = d
+		} else if s, err := strconv.Atoi(to); err == nil {
+			cfg.Timeout = time.Duration(s) * time.Second
 		}
+	}
 
-		if hasCustomTLSOptions(opts, nil) {
-			sslCA := opts["ssl_ca"]
-			if sslCA == "" {
-				sslCA = opts["sslrootcert"]
-			}
-			sslCert := opts["ssl_cert"]
-			sslKey := opts["ssl_key"]
-			requestedTLS := opts["ssl_mode"]
-			if requestedTLS == "" {
-				requestedTLS = opts["sslmode"]
-			}
-			if requestedTLS == "" {
-				requestedTLS = cfg.TLSConfig
-			}
-			tlsHost := ""
-			if cfg.Net != "unix" {
-				tlsHost = normalizeTLSHostname(cfg.Addr)
-			}
-			configKey, err := setupCustomTLS(tlsHost, requestedTLS, sslCA, sslCert, sslKey)
-			if err != nil {
-				return "", err
-			}
-			cfg.TLSConfig = configKey
+	if hasCustomTLSOptions(opts, nil) {
+		sslCA := firstNonEmpty(opts["ssl_ca"], opts["sslrootcert"])
+		sslCert := opts["ssl_cert"]
+		sslKey := opts["ssl_key"]
+		requestedTLS := firstNonEmpty(opts["ssl_mode"], opts["sslmode"], cfg.TLSConfig)
+		tlsHost := ""
+		if cfg.Net != "unix" {
+			tlsHost = normalizeTLSHostname(cfg.Addr)
 		}
+		configKey, err := setupCustomTLS(tlsHost, requestedTLS, sslCA, sslCert, sslKey)
+		if err != nil {
+			return "", err
+		}
+		cfg.TLSConfig = configKey
 	}
 
 	return cfg.FormatDSN(), nil
